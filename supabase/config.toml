@@ -1,0 +1,16 @@
+project_id = "publicpulse"
+[api]
+enabled = true
+port = 54321
+[db]
+port = 54322
+major_version = 15
+[db.seed]
+enabled = true
+sql_paths = ["./seed.sql"]
+[auth]
+enabled = true
+site_url = "http://localhost:5173"
+enable_signup = false
+[functions.api]
+verify_jwt = false

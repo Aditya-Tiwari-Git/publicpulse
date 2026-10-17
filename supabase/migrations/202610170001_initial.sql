@@ -1,0 +1,92 @@
+create extension if not exists pgcrypto;
+create table public.roles (name text primary key check(name in ('admin','surveyor')));
+insert into public.roles values ('admin'),('surveyor');
+create table public.profiles (id uuid primary key references auth.users on delete cascade,username text not null unique check(username ~ '^[a-zA-Z0-9_.-]{3,50}$'),name text not null,role text not null references public.roles,active boolean not null default true,must_change_password boolean not null default true,created_at timestamptz not null default now());
+create schema if not exists private;
+revoke all on schema private from public,anon,authenticated;
+create table private.auth_mapping (username text primary key,user_id uuid unique not null references public.profiles on delete cascade,email text not null);
+create table private.login_attempts (key text primary key,attempts integer not null default 0,window_start timestamptz not null default now());
+create table public.survey_campaigns (id uuid primary key default gen_random_uuid(),name text not null);
+create table public.surveys (id uuid primary key default gen_random_uuid(),title text not null,description text not null default '',status text not null default 'draft' check(status in ('draft','published','archived')),version integer not null default 0,definition jsonb not null default '{}',campaign_id uuid references public.survey_campaigns,start_at timestamptz,end_at timestamptz,quota integer check(quota>0),coverage text[],created_at timestamptz not null default now());
+create table public.survey_versions (id uuid primary key default gen_random_uuid(),survey_id uuid not null references public.surveys,version integer not null check(version>0),definition jsonb not null,created_at timestamptz not null default now(),unique(survey_id,version));
+create table public.survey_sections (id uuid primary key default gen_random_uuid(),version_id uuid not null references public.survey_versions,name text not null,display_order integer not null);
+create table public.questions (id uuid primary key default gen_random_uuid(),version_id uuid not null references public.survey_versions,section_id uuid references public.survey_sections,question_key text not null,definition jsonb not null,display_order integer not null,unique(version_id,question_key));
+create table public.question_options (id uuid primary key default gen_random_uuid(),question_id uuid not null references public.questions,display_order integer not null,value text not null,label_en text not null,label_hi text);
+create table public.branching_rules (id uuid primary key default gen_random_uuid(),version_id uuid not null references public.survey_versions,definition jsonb not null);
+create table public.geographies (id uuid primary key default gen_random_uuid(),name text not null,level text not null check(level in ('country','state','district','constituency','locality','ward')),parent_id uuid references public.geographies,code text,check(parent_id is distinct from id));
+create table public.survey_assignments (id uuid primary key default gen_random_uuid(),survey_id uuid not null references public.surveys,surveyor_id uuid not null references public.profiles,quota integer not null default 100 check(quota>0),geography_id uuid references public.geographies,unique(survey_id,surveyor_id));
+create table public.responses (id uuid primary key,survey_id uuid not null,version integer not null,surveyor_id uuid not null references public.profiles,created_at timestamptz not null default now(),collected_at timestamptz not null,geography text not null default '',state text not null default '',district text not null default '',mode text not null,answers jsonb not null,consent boolean not null,status text not null check(status in ('completed','declined')),synthetic boolean not null default false,validation_status text not null default 'valid',sync_status text not null default 'synced',foreign key(survey_id,version) references public.survey_versions(survey_id,version));
+create table public.response_answers (id uuid primary key default gen_random_uuid(),response_id uuid not null references public.responses on delete cascade,question_key text not null,value jsonb,unique(response_id,question_key));
+create table public.dashboard_configs (id uuid primary key default gen_random_uuid(),title text not null,published boolean not null default false);
+create table public.dashboard_widgets (id uuid primary key default gen_random_uuid(),dashboard_id uuid not null references public.dashboard_configs on delete cascade,definition jsonb not null,display_order integer not null);
+create table public.issue_categories (id uuid primary key default gen_random_uuid(),name text unique not null);
+create table public.classification_rules (id uuid primary key default gen_random_uuid(),category text not null,keywords text[] not null);
+create table public.classification_reviews (response_id uuid primary key references public.responses on delete cascade,category text,reviewed_by uuid references public.profiles,reviewed_at timestamptz default now());
+create table public.audit_logs (id uuid primary key default gen_random_uuid(),actor text not null,action text not null,created_at timestamptz not null default now());
+create table public.settings (id boolean primary key default true check(id),organization text not null default 'PublicPulse Research',min_sample integer not null default 5 check(min_sample>=5),income_bands jsonb not null default '[]');
+insert into public.settings(id) values(true);
+create index responses_survey_date_idx on public.responses(survey_id,collected_at);
+create index responses_surveyor_idx on public.responses(surveyor_id);
+create index responses_geography_idx on public.responses(state,district);
+create index assignments_surveyor_idx on public.survey_assignments(surveyor_id);
+create index questions_version_idx on public.questions(version_id);
+create index answers_question_idx on public.response_answers(question_key);
+create index geography_parent_idx on public.geographies(parent_id);
+create index audit_date_idx on public.audit_logs(created_at desc);
+create function public.is_active() returns boolean language sql stable security definer set search_path='' as $$ select exists(select 1 from public.profiles where id=auth.uid() and active and not must_change_password) $$;
+create function public.is_admin() returns boolean language sql stable security definer set search_path='' as $$ select exists(select 1 from public.profiles where id=auth.uid() and role='admin' and active and not must_change_password) $$;
+create function public.can_read_survey(sid uuid) returns boolean language sql stable security definer set search_path='' as $$ select public.is_active() and (public.is_admin() or exists(select 1 from public.survey_assignments where survey_id=sid and surveyor_id=auth.uid())) $$;
+do $$ declare t text;begin foreach t in array array['roles','profiles','surveys','survey_versions','survey_sections','questions','question_options','branching_rules','survey_assignments','responses','response_answers','geographies','survey_campaigns','dashboard_configs','dashboard_widgets','issue_categories','classification_rules','classification_reviews','audit_logs','settings'] loop execute format('alter table public.%I enable row level security',t);execute format('create policy admin_read on public.%I for select to authenticated using(public.is_admin())',t);end loop;end $$;
+-- All mutation paths use verified Edge Functions; no browser role can write directly.
+create policy self_profile on public.profiles for select to authenticated using(id=auth.uid());
+create policy assigned_surveys on public.surveys for select to authenticated using(public.can_read_survey(id));
+create policy assigned_versions on public.survey_versions for select to authenticated using(public.can_read_survey(survey_id));
+create policy own_assignments on public.survey_assignments for select to authenticated using(surveyor_id=auth.uid() and public.is_active());
+create policy own_responses on public.responses for select to authenticated using(surveyor_id=auth.uid() and public.is_active());
+create policy own_answers on public.response_answers for select to authenticated using(exists(select 1 from public.responses r where r.id=response_id and r.surveyor_id=auth.uid()) and public.is_active());
+create policy geo_read on public.geographies for select to authenticated using(public.is_active());
+create policy settings_read on public.settings for select to authenticated using(public.is_active());
+create function private.immutable_version() returns trigger language plpgsql as $$begin raise exception 'Published survey versions are immutable';end $$;
+create trigger immutable_versions before update or delete on public.survey_versions for each row execute function private.immutable_version();
+create function private.immutable_response() returns trigger language plpgsql as $$begin if TG_OP='DELETE' and OLD.synthetic then return OLD;end if;raise exception 'Submitted responses are immutable';end $$;
+create trigger immutable_responses before update or delete on public.responses for each row execute function private.immutable_response();
+create function public.reserve_login(attempt_key text) returns boolean language plpgsql security definer set search_path='' as $$declare n integer;begin insert into private.login_attempts(key,attempts) values(attempt_key,1) on conflict(key) do update set attempts=case when private.login_attempts.window_start<now()-interval '15 minutes' then 1 else private.login_attempts.attempts+1 end,window_start=case when private.login_attempts.window_start<now()-interval '15 minutes' then now() else private.login_attempts.window_start end returning attempts into n;return n<=10;end $$;
+create function public.auth_mapping_lookup(login_name text) returns table(user_id uuid,email text) language sql security definer set search_path='' as $$ select user_id,email from private.auth_mapping where username=lower(login_name) $$;
+create function public.auth_mapping_set(login_name text,uid uuid,auth_email text) returns void language sql security definer set search_path='' as $$insert into private.auth_mapping values(lower(login_name),uid,auth_email) on conflict(username) do update set email=excluded.email,user_id=excluded.user_id $$;
+create function public.save_survey(doc jsonb) returns void language plpgsql security definer set search_path='' as $$declare sid uuid:=(doc->>'id')::uuid;v jsonb;vid uuid;item jsonb;sect text;secid uuid;qid uuid;pos integer;optpos integer;opt jsonb;begin
+ perform pg_advisory_xact_lock(hashtext(sid::text));
+ insert into public.surveys(id,title,description,status,version,definition,start_at,end_at,quota,coverage) values(sid,doc->>'title',coalesce(doc->>'description',''),doc->>'status',(doc->>'version')::int,doc,nullif(doc->>'start','')::timestamptz,nullif(doc->>'end','')::timestamptz,nullif(doc->>'quota','')::int,array(select jsonb_array_elements_text(coalesce(doc->'coverage','[]')))) on conflict(id) do update set title=excluded.title,description=excluded.description,status=excluded.status,version=excluded.version,definition=excluded.definition,start_at=excluded.start_at,end_at=excluded.end_at,quota=excluded.quota,coverage=excluded.coverage;
+ for v in select * from jsonb_array_elements(coalesce(doc->'published','[]')) loop
+ if exists(select 1 from public.survey_versions where survey_id=sid and version=(v->>'version')::int and definition<>v) then raise exception 'Published version conflict';end if;
+ if not exists(select 1 from public.survey_versions where survey_id=sid and version=(v->>'version')::int) then
+ insert into public.survey_versions(id,survey_id,version,definition) values((v->>'id')::uuid,sid,(v->>'version')::int,v) returning id into vid;
+ pos:=0;for item in select * from jsonb_array_elements(v->'questions') loop
+ sect:=item->>'section';select id into secid from public.survey_sections where version_id=vid and name=sect;
+ if secid is null then insert into public.survey_sections(version_id,name,display_order) values(vid,sect,pos) returning id into secid;end if;
+ insert into public.questions(version_id,section_id,question_key,definition,display_order) values(vid,secid,item->>'id',item,pos) returning id into qid;
+ optpos:=0;for opt in select value from jsonb_array_elements(coalesce(item->'options','[]')) loop insert into public.question_options(question_id,display_order,value,label_en,label_hi) values(qid,optpos,opt#>>'{}',opt#>>'{}',item->'optionsHi'->>optpos);optpos:=optpos+1;end loop;pos:=pos+1;
+ end loop;
+ for item in select * from jsonb_array_elements(v->'rules') loop insert into public.branching_rules(version_id,definition) values(vid,item);end loop;
+ end if;end loop;end $$;
+create function public.submit_response(doc jsonb) returns uuid language plpgsql security definer set search_path='' as $$declare rid uuid:=(doc->>'id')::uuid;sid uuid:=(doc->>'survey_id')::uuid;uid uuid:=(doc->>'surveyor_id')::uuid;existing public.responses;sv public.surveys;a public.survey_assignments;item record;begin
+ perform pg_advisory_xact_lock(hashtext(sid::text));
+ select * into existing from public.responses where id=rid;
+ if found then if existing.surveyor_id<>uid or existing.survey_id<>sid or existing.version<>(doc->>'version')::int or existing.answers<>doc->'answers' or existing.collected_at<>(doc->>'created_at')::timestamptz or existing.consent<>(doc->>'consent')::boolean or existing.status<>doc->>'status' or existing.mode<>doc->>'mode' then raise exception 'Idempotency conflict';end if;return rid;end if;
+ select * into sv from public.surveys where id=sid;
+ if sv.status<>'published' or (sv.start_at is not null and now()<sv.start_at) or (sv.end_at is not null and now()>sv.end_at) then raise exception 'Survey is not open';end if;
+ select * into a from public.survey_assignments where survey_id=sid and surveyor_id=uid;
+ if not found and not exists(select 1 from public.profiles where id=uid and role='admin' and active) then raise exception 'Not assigned';end if;
+ if a.quota is not null and (select count(*) from public.responses where survey_id=sid and surveyor_id=uid)>=a.quota then raise exception 'Assignment quota reached';end if;
+ if sv.quota is not null and (select count(*) from public.responses where survey_id=sid)>=sv.quota then raise exception 'Survey quota reached';end if;
+ if doc->>'status'='completed' and cardinality(sv.coverage)>0 and not (doc->>'state'=any(sv.coverage)) then raise exception 'Outside survey coverage';end if;
+ if doc->>'status'='completed' and a.geography_id is not null and not exists(with recursive lineage as(select id,parent_id from public.geographies where id::text=doc->>'geography' union select g.id,g.parent_id from public.geographies g join lineage child on child.parent_id=g.id) select 1 from lineage where id=a.geography_id) then raise exception 'Outside assignment coverage';end if;
+ insert into public.responses(id,survey_id,version,surveyor_id,collected_at,geography,state,district,mode,answers,consent,status,synthetic) values(rid,sid,(doc->>'version')::int,uid,(doc->>'created_at')::timestamptz,coalesce(doc->>'geography',''),coalesce(doc->>'state',''),coalesce(doc->>'district',''),doc->>'mode',doc->'answers',(doc->>'consent')::boolean,doc->>'status',coalesce((doc->>'synthetic')::boolean,false));
+ for item in select * from jsonb_each(doc->'answers') loop insert into public.response_answers(response_id,question_key,value) values(rid,item.key,item.value);end loop;
+ insert into public.audit_logs(actor,action) values(uid::text,'Response submitted: '||rid);return rid;end $$;
+create function public.aggregate_question(sid uuid,qkey text,min_n integer default 5) returns table(label text,n bigint,suppressed boolean) language sql stable security definer set search_path='' as $$
+ with vals as(select case when jsonb_typeof(answers->qkey)='array' then answers->qkey else jsonb_build_array(answers->qkey) end v from public.responses where survey_id=sid and status='completed' and public.is_admin()),counts as(select value#>>'{}' label,count(*) n from vals,jsonb_array_elements(v) group by value) select label,case when n>=greatest(5,min_n,(select min_sample from public.settings limit 1)) then n else null end,n<greatest(5,min_n,(select min_sample from public.settings limit 1)) from counts $$;
+-- Privileged RPCs are callable only by the service role inside verified functions.
+revoke all on function public.reserve_login(text),public.auth_mapping_lookup(text),public.auth_mapping_set(text,uuid,text),public.save_survey(jsonb),public.submit_response(jsonb) from public,anon,authenticated;
+grant execute on function public.reserve_login(text),public.auth_mapping_lookup(text),public.auth_mapping_set(text,uuid,text),public.save_survey(jsonb),public.submit_response(jsonb) to service_role;
+revoke all on function public.aggregate_question(uuid,text,integer) from public,anon;
+grant execute on function public.aggregate_question(uuid,text,integer) to authenticated;
