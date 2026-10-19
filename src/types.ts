@@ -88,7 +88,7 @@ export type ResponseRecord = {
   id: string;
   survey_id: string;
   version: number;
-  surveyor_id: string;
+  surveyor_id: string | null;
   created_at: string;
   geography: string;
   state: string;
@@ -98,6 +98,7 @@ export type ResponseRecord = {
   consent: boolean;
   status: "completed" | "declined";
   synthetic: boolean;
+  source?: "surveyor" | "public_link" | "qr";
   validation_status?: string;
   sync_status?: string;
 };

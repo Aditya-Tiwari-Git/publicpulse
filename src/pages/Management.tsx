@@ -562,7 +562,7 @@ export function Responses({ own = false }: { own?: boolean }) {
                 ID: r.id,
                 Survey: r.survey_id,
                 Version: r.version,
-                Surveyor: r.surveyor_id,
+                Collector: r.surveyor_id ? data.profiles.find((p) => p.id === r.surveyor_id)?.name || "Field surveyor" : r.source === "qr" ? "QR link" : "Public link",
                 Collected: r.created_at,
                 State: r.state,
                 District: r.district,
@@ -620,7 +620,7 @@ export function Responses({ own = false }: { own?: boolean }) {
                 <th>Response ID</th>
                 <th>Collection date</th>
                 <th>Geography</th>
-                <th>Surveyor</th>
+                <th>Collection source</th>
                 <th>Version</th>
                 <th>Consent / status</th>
                 <th />
@@ -649,8 +649,7 @@ export function Responses({ own = false }: { own?: boolean }) {
                     <small className="cell-sub">{r.state}</small>
                   </td>
                   <td>
-                    {data.profiles.find((p) => p.id === r.surveyor_id)?.name ||
-                      profile.name}
+                    {r.surveyor_id ? data.profiles.find((p) => p.id === r.surveyor_id)?.name || "Field surveyor" : r.source === "qr" ? "QR link" : "Public link"}
                   </td>
                   <td>v{r.version}</td>
                   <td>

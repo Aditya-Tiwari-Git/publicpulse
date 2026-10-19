@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import QRCode from "qrcode";
 import { useNavigate } from "react-router-dom";
 import {
   Plus,
@@ -20,6 +21,7 @@ import { useWorkspace } from "../context";
 import { Button } from "../components/ui/button";
 import { Badge, PageTitle, Empty, Modal } from "../components/common";
 import { publishSurvey } from "../lib/engine";
+import { demoMode, edge, supabase } from "../lib/api";
 import type { Survey } from "../types";
 export default function Surveys() {
   const { data, update } = useWorkspace(),
@@ -27,7 +29,34 @@ export default function Surveys() {
   const [filter, setFilter] = useState("all"),
     [search, setSearch] = useState(""),
     [config, setConfig] = useState<Survey | null>(null),
-    [confirm, setConfirm] = useState<Survey | null>(null);
+    [confirm, setConfirm] = useState<Survey | null>(null),
+    [share, setShare] = useState<Survey | null>(null),
+    [selectedVersion, setSelectedVersion] = useState(""),
+    [publicLink, setPublicLink] = useState(""),
+    [qrData, setQrData] = useState(""),
+    [expiresAt, setExpiresAt] = useState(""),
+    [anonymous, setAnonymous] = useState(true),
+    [publicLinks, setPublicLinks] = useState<Array<{id:string;survey_id:string;version:number;active:boolean;expired:boolean;expires_at:string|null;responses:number}>>([]);
+  async function refreshPublicLinks() {
+    if (demoMode) return;
+    try { setPublicLinks(await edge("list-public-links")); } catch (e) { toast.error((e as Error).message); }
+  }
+  useEffect(() => { void refreshPublicLinks(); }, []);
+  async function createPublicLink() {
+    if (!share) return;
+    const version = share.published?.find((item) => item.version === Number(selectedVersion));
+    if (!version) return toast.error("Publish a survey version first.");
+    const bytes = crypto.getRandomValues(new Uint8Array(32));
+    const token = btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    try {
+      await edge("create-public-link", { survey_id: share.id, version: version.version, token, expires_at: expiresAt ? new Date(expiresAt).toISOString() : null, anonymous_allowed: anonymous });
+      const url = `${window.location.origin}/survey/${token}`;
+      setPublicLink(url);
+      setQrData(await QRCode.toDataURL(`${url}?source=qr`, { errorCorrectionLevel: "M", width: 360, margin: 2 }));
+      await refreshPublicLinks();
+      toast.success("Public survey link created. Copy it now; the token is not stored in readable form.");
+    } catch (e) { toast.error((e as Error).message); }
+  }
   const list = data.surveys.filter(
     (s) =>
       (filter === "all" || s.status === filter) &&
@@ -199,25 +228,7 @@ export default function Surveys() {
                         <Eye size={13} />
                         Collect
                       </button>
-                      <button
-                        onClick={() => {
-                          navigator.clipboard
-                            .writeText(`${location.origin}/collect/${s.id}`)
-                            .then(() =>
-                              toast.success(
-                                "Authorized survey link copied. Login is required.",
-                              ),
-                            )
-                            .catch(() =>
-                              toast.error(
-                                "Clipboard unavailable. Copy the collection URL from your address bar.",
-                              ),
-                            );
-                        }}
-                      >
-                        <Link size={13} />
-                        Copy link
-                      </button>
+                      <button disabled={!supabase} title={!supabase ? "Connect Supabase to create a public link." : undefined} onClick={() => { setShare(s); setSelectedVersion(String(s.published?.at(-1)?.version || "")); setPublicLink(""); setQrData(""); setExpiresAt(""); setAnonymous(true); }}><Link size={13} />Create public link</button>
                     </>
                   )}
                 </div>
@@ -237,6 +248,29 @@ export default function Surveys() {
           }
         />
       )}
+      <Modal
+        title="Create public survey link"
+        description="This link opens one immutable published version. Anyone with the link can respond while it is active."
+        open={!!share}
+        onClose={() => { setShare(null); setPublicLink(""); setQrData(""); setSelectedVersion(""); }}
+      >
+        {share && <div className="prose">
+          <p><strong>{share.title}</strong></p>
+          {!publicLink ? <>
+            <label>Published survey version<select value={selectedVersion} onChange={(e) => setSelectedVersion(e.target.value)}>{(share.published || []).map((version) => <option key={version.version} value={version.version}>Version {version.version} · {new Date(version.created_at).toLocaleDateString()}</option>)}</select></label>
+            <label>Link expiry (optional)<input type="datetime-local" value={expiresAt} onChange={(e) => setExpiresAt(e.target.value)} /></label>
+            <label className="check-row"><input type="checkbox" checked={anonymous} onChange={(e) => setAnonymous(e.target.checked)} />Allow anonymous responses</label>
+            <p>Anonymous participation is enabled by default. If disabled, this link will reject submissions; respondent accounts are not available in this release. The system limits repeated requests but cannot guarantee that anonymous participants submit only once.</p>
+            <Button onClick={createPublicLink}>Generate secure link</Button>
+          </> : <>
+            <label>Public URL<input readOnly value={publicLink} onFocus={(e) => e.currentTarget.select()} /></label>
+            <div className="modal-actions"><Button variant="outline" onClick={() => navigator.clipboard.writeText(publicLink).then(() => toast.success("Link copied."))}>Copy URL</Button><a className="btn btn-outline" href={publicLink} target="_blank" rel="noreferrer">Preview</a></div>
+            {qrData && <div className="public-qr"><img src={qrData} alt="QR code for the public survey" /><a className="btn btn-outline" href={qrData} download={`publicpulse-survey-v${selectedVersion}-qr.png`}>Download QR code</a><small>The QR encodes this link with a source label for QR analytics.</small></div>}
+            <p>Save this URL securely. Its token cannot be recovered from the database after this dialog closes.</p>
+          </>}
+        </div>}
+      </Modal>
+      <section className="public-link-list"><h2>Public survey links</h2>{publicLinks.map((link) => <div className="public-link-row" key={link.id}><span><strong>{data.surveys.find((s) => s.id === link.survey_id)?.title || "Survey"}</strong><small>Version {link.version} · {link.responses} responses{link.expires_at ? ` · expires ${new Date(link.expires_at).toLocaleString()}` : ""}</small></span><Badge tone={link.expired || !link.active ? "gray" : "teal"}>{link.expired ? "expired" : link.active ? "active" : "inactive"}</Badge>{!link.expired && <Button size="sm" variant="outline" onClick={async () => { try { await edge("set-public-link", { id: link.id, active: !link.active }); await refreshPublicLinks(); } catch (e) { toast.error((e as Error).message); } }}>{link.active ? "Deactivate" : "Activate"}</Button>}</div>)}</section>
       <Modal
         title="Survey collection settings"
         open={!!config}

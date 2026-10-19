@@ -12,6 +12,10 @@ export default defineConfig({
     command: "npm run dev -- --port 5187 --strictPort",
     url: "http://127.0.0.1:5187",
     reuseExistingServer: false,
-    env: { VITE_DEMO_MODE: "true" },
+    env: {
+      VITE_DEMO_MODE: "true",
+      VITE_SUPABASE_URL: "https://publicpulse-e2e.supabase.co",
+      VITE_SUPABASE_ANON_KEY: "public-test-key",
+    },
   },
 });

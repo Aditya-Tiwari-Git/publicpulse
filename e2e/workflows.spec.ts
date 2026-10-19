@@ -33,6 +33,52 @@ test("workspace renders without runtime errors or horizontal overflow", async ({
   ).toBe(true);
   expect(errors).toEqual([]);
 });
+test("public survey works without workspace login and stays within the mobile viewport", async ({ page }, info) => {
+  const calls: string[] = [];
+  await page.route("https://publicpulse-e2e.supabase.co/functions/v1/api", async (route) => {
+    const body = route.request().postDataJSON();
+    calls.push(body.action);
+    if (body.action === "public-survey") return route.fulfill({ json: { survey: {
+      id: "10000000-0000-4000-8000-000000000001", title: "Community services survey", description: "A short voluntary survey.", status: "published", version: 1,
+      questions: [
+        { id: "consent", type: "single", label: "May I ask a few questions?", hi: "क्या मैं कुछ प्रश्न पूछ सकता/सकती हूँ?", options: ["I agree to participate", "I decline"], required: true, section: "Consent" },
+        { id: "state", type: "geography", label: "State or Union Territory", hi: "राज्य या केंद्र शासित प्रदेश", required: true, section: "Area" },
+        { id: "district", type: "geography", label: "District", hi: "ज़िला", required: true, section: "Area" },
+      ], rules: [],
+    }, geographies: [
+      { id: "20000000-0000-4000-8000-000000000001", name: "Test UT", level: "state", parent_id: null },
+      { id: "20000000-0000-4000-8000-000000000002", name: "Test District", level: "district", parent_id: "20000000-0000-4000-8000-000000000001" },
+    ] } });
+    if (body.action === "submit-public-response") return route.fulfill({ json: { ok: true } });
+    return route.fulfill({ status: 400, json: { error: "Unexpected e2e action" } });
+  });
+  await page.goto("/survey/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  await expect(page.getByRole("heading", { name: "Community services survey" })).toBeVisible();
+  await page.getByRole("radio", { name: "I agree to participate" }).check();
+  await page.locator("select").nth(0).selectOption({ label: "Test UT" });
+  await page.locator("select").nth(1).selectOption({ label: "Test District" });
+  await page.getByRole("button", { name: "Review answers" }).click();
+  await page.getByRole("button", { name: "Submit response" }).click();
+  await expect(page.getByRole("heading", { name: "Thank you" })).toBeVisible();
+  expect(calls.filter((x) => x === "public-survey").length).toBeGreaterThanOrEqual(1);
+  expect(calls.filter((x) => x === "submit-public-response")).toHaveLength(1);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+test("admin creates a one-time public URL and downloadable QR code", async ({ page }) => {
+  await page.route("https://publicpulse-e2e.supabase.co/functions/v1/api", async (route) => {
+    const body = route.request().postDataJSON();
+    if (body.action === "list-public-links") return route.fulfill({ json: [] });
+    if (body.action === "create-public-link") return route.fulfill({ json: { ok: true } });
+    return route.fulfill({ status: 400, json: { error: "Unexpected e2e action" } });
+  });
+  await enter(page);
+  await go(page, "/surveys");
+  await page.getByRole("button", { name: "Create public link", exact: true }).first().click();
+  await page.getByRole("button", { name: "Generate secure link", exact: true }).click();
+  await expect(page.getByRole("img", { name: "QR code for the public survey" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Download QR code" })).toBeVisible();
+  await expect(page.getByLabel("Public URL")).toHaveValue(/\/survey\/[A-Za-z0-9_-]{43}$/);
+});
 test("admin can inspect insights, publish a survey version, and save a dashboard", async ({
   page,
 }) => {
@@ -115,7 +161,7 @@ test("required validation, bilingual collection and offline queue survive naviga
   await page.getByRole("button", { name: "हिन्दी" }).click();
   await expect(
     page.getByText(
-      "क्या हम आपके क्षेत्र की सार्वजनिक सेवाओं के बारे में कुछ प्रश्न पूछ सकते हैं?",
+      "क्या मैं आपके क्षेत्र की सार्वजनिक सेवाओं के बारे में कुछ प्रश्न पूछ सकता/सकती हूँ?",
     ),
   ).toBeVisible();
   await page.getByRole("button", { name: "English", exact: true }).click();
@@ -139,7 +185,7 @@ test("surveyor completes a consented branched interview and reviews before submi
   await page.getByText("I agree to participate", { exact: true }).click();
   await page.getByRole("button", { name: "Continue", exact: true }).click();
   await page
-    .getByLabel("State / Union Territory", { exact: true })
+    .getByLabel("State or Union Territory", { exact: true })
     .selectOption("Maharashtra");
   await page.getByLabel("District", { exact: true }).selectOption("Pune");
   await page.getByRole("radio", { name: "Urban", exact: true }).check();
@@ -148,18 +194,20 @@ test("surveyor completes a consented branched interview and reviews before submi
   await page.getByRole("checkbox", { name: "Roads", exact: true }).check();
   await page.getByRole("radio", { name: "Roads", exact: true }).check();
   await expect(
-    page.getByText("What type of road problem?", { exact: true }),
+    page.getByText("What road issue have you experienced?", { exact: true }),
   ).toBeVisible();
   await expect(
     page.getByText("What type of water problem?", { exact: true }),
   ).not.toBeVisible();
   await page.getByRole("checkbox", { name: "Potholes", exact: true }).check();
-  await page.getByRole("radio", { name: "Very serious", exact: true }).check();
+  await page.getByRole("button", { name: "5 out of 5", exact: true }).click();
   await page.getByRole("button", { name: "Continue", exact: true }).click();
   await page
     .getByRole("radio", { name: "Somewhat satisfied", exact: true })
     .first()
     .check();
+  await page.getByRole("button", { name: "Continue", exact: true }).click();
+  await page.getByRole("radio", { name: "No", exact: true }).check();
   await page.getByRole("button", { name: "Continue", exact: true }).click();
   await page
     .getByRole("button", { name: "Review answers", exact: true })

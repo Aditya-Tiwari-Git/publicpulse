@@ -42,6 +42,7 @@ import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { WorkspaceProvider, useWorkspace } from "./context";
+import PublicSurvey from "./pages/PublicSurvey";
 import { demoMode, login, logout, getProfile, edge } from "./lib/api";
 import { demoAdmin } from "./lib/demo";
 import type { Profile } from "./types";
@@ -719,7 +720,10 @@ export default function App() {
   return (
     <QueryClientProvider client={client}>
       <BrowserRouter>
-        <Root />
+        <Routes>
+          <Route path="/survey/:token" element={<PublicSurvey />} />
+          <Route path="*" element={<Root />} />
+        </Routes>
       </BrowserRouter>
       <Toaster richColors position="bottom-right" />
     </QueryClientProvider>

@@ -99,6 +99,12 @@ describe("Branching operators", () => {
   });
 });
 describe("Form validation", () => {
+  it("keeps the current representative question optional free text by default", () => {
+    const q = defaultSurvey().questions.find((item) => item.id === "current_rep");
+    expect(q).toMatchObject({ type: "short", required: false });
+    expect(q?.options).toBeUndefined();
+    expect(validateAnswer(q!, "A respondent-entered name", {})).toBeUndefined();
+  });
   it("requires mandatory answers and validates option membership", () => {
     const q = defaultSurvey().questions.find((q) => q.id === "priority")!;
     expect(validateAnswer(q, "", {})).toBeTruthy();

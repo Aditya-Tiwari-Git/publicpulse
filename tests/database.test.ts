@@ -19,6 +19,11 @@ beforeAll(async () => {
     "utf8",
   ).replace("create extension if not exists pgcrypto;", "");
   await db.exec(sql);
+  const publicSql = readFileSync(
+    new URL("../supabase/migrations/202610190002_public_links.sql", import.meta.url),
+    "utf8",
+  );
+  await db.exec(publicSql);
   await db.exec(
     `grant usage on schema public to anon,authenticated;grant select,insert,update,delete on all tables in schema public to authenticated;insert into auth.users values('${admin}'),('${field}'),('${other}');insert into public.profiles(id,username,name,role,must_change_password) values('${admin}','admin','Admin','admin',false),('${field}','field1','Field One','surveyor',false),('${other}','field2','Field Two','surveyor',false);`,
   );
@@ -62,6 +67,22 @@ describe("PostgreSQL migration and access boundaries", () => {
       ["public", "r"],
     );
     expect(r.rows).toEqual([]);
+  });
+  it("adds public links without changing the source of historical responses", async () => {
+    const cols = await db.query<{ column_name: string; is_nullable: string; column_default: string | null }>(
+      "select column_name,is_nullable,column_default from information_schema.columns where table_schema='public' and table_name='responses' and column_name in ('source','surveyor_id') order by column_name",
+    );
+    expect(cols.rows.find((c) => c.column_name === "source")?.column_default).toContain("surveyor");
+    expect(cols.rows.find((c) => c.column_name === "surveyor_id")?.is_nullable).toBe("YES");
+    const rls = await db.query<{ relrowsecurity: boolean }>("select relrowsecurity from pg_class where relname='public_survey_links'");
+    expect(rls.rows[0].relrowsecurity).toBe(true);
+  });
+  it("rate limits hashed public-link attempts in a separate window", async () => {
+    const key = "c".repeat(64);
+    const a = await db.query<{ reserve_public_attempt: boolean }>("select public.reserve_public_attempt($1,2)", [key]);
+    const b = await db.query<{ reserve_public_attempt: boolean }>("select public.reserve_public_attempt($1,2)", [key]);
+    const c = await db.query<{ reserve_public_attempt: boolean }>("select public.reserve_public_attempt($1,2)", [key]);
+    expect([a.rows[0].reserve_public_attempt,b.rows[0].reserve_public_attempt,c.rows[0].reserve_public_attempt]).toEqual([true,true,false]);
   });
   it("gives surveyors only assigned surveys and their own profile", async () => {
     await asUser(field, async () => {
@@ -170,6 +191,8 @@ describe("Atomic response submission", () => {
     expect(
       (await db.query("select * from public.response_answers")).rows,
     ).toHaveLength(2);
+    const source = await db.query<{ source: string }>("select source from public.responses where id=$1", [record.id]);
+    expect(source.rows[0].source).toBe("surveyor");
   });
   it("rejects changed content for an existing ID", async () => {
     await expect(
@@ -228,5 +251,32 @@ describe("Atomic response submission", () => {
       expect(r.rows[0].n).toBe(null);
       expect(r.rows[0].suppressed).toBe(true);
     });
+  });
+});
+describe("Anonymous public link submissions", () => {
+  const hash = "a".repeat(64);
+  const doc = {
+    id: crypto.randomUUID(), survey_id: survey.id, version: 1,
+    created_at: new Date().toISOString(), answers: { consent: "I agree to participate" },
+    consent: true, status: "completed", state: "", district: "", geography: "",
+  };
+  it("accepts an active published link and records a non-account source", async () => {
+    await db.query("insert into public.public_survey_links(token_hash,survey_id,version,created_by) values($1,$2,1,$3)", [hash,survey.id,admin]);
+    await db.query("select public.submit_public_response($1,$2::jsonb,$3)", [hash,JSON.stringify(doc),"qr"]);
+    const r = await db.query<{ surveyor_id: string | null; source: string; answers: Record<string, unknown> }>("select surveyor_id,source,answers from public.responses where id=$1", [doc.id]);
+    expect(r.rows[0]).toMatchObject({ surveyor_id: null, source: "qr", answers: doc.answers });
+  });
+  it("rejects inactive links and protects link records from anonymous reads", async () => {
+    await db.query("insert into public.public_survey_links(token_hash,survey_id,version,created_by,active) values($1,$2,1,$3,false)", ["b".repeat(64),survey.id,admin]);
+    await expect(db.query("select public.submit_public_response($1,$2::jsonb,$3)", ["b".repeat(64),JSON.stringify({ ...doc, id: crypto.randomUUID() }),"public_link"])).rejects.toThrow(/inactive or expired/);
+    await db.exec("set role anon");
+    try { await expect(db.query("select * from public.public_survey_links")).rejects.toThrow(); }
+    finally { await db.exec("reset role"); }
+  });
+  it("rejects expired links and links that disallow anonymous responses", async () => {
+    await db.query("insert into public.public_survey_links(token_hash,survey_id,version,created_by,expires_at) values($1,$2,1,$3,now()-interval '1 second')", ["d".repeat(64),survey.id,admin]);
+    await db.query("insert into public.public_survey_links(token_hash,survey_id,version,created_by,anonymous_allowed) values($1,$2,1,$3,false)", ["e".repeat(64),survey.id,admin]);
+    await expect(db.query("select public.submit_public_response($1,$2::jsonb,$3)", ["d".repeat(64),JSON.stringify({ ...doc, id: crypto.randomUUID() }),"public_link"])).rejects.toThrow(/inactive or expired/);
+    await expect(db.query("select public.submit_public_response($1,$2::jsonb,$3)", ["e".repeat(64),JSON.stringify({ ...doc, id: crypto.randomUUID() }),"public_link"])).rejects.toThrow(/does not allow anonymous/);
   });
 });

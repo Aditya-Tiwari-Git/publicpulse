@@ -12,7 +12,7 @@ supabase link --project-ref YOUR_PROJECT_REF
 supabase db push
 ```
 
-Alternatively, run `supabase/migrations/202610170001_initial.sql` in the project's SQL editor once and then run `supabase/seed.sql` for issue categories. Prefer migrations for reproducible deployments. Do not create the default admin in a public project. Follow [ADMIN_SETUP.md](ADMIN_SETUP.md) with a unique password.
+For a manual SQL-editor setup, apply every committed migration in filename order, then run `supabase/seed.sql` for issue categories. Prefer migrations for reproducible deployments. Do not create the default admin in a public project. Follow [ADMIN_SETUP.md](ADMIN_SETUP.md) with a unique password.
 
 Local backend:
 
@@ -31,6 +31,17 @@ supabase secrets set ALLOWED_ORIGINS=https://YOUR_PROJECT.pages.dev
 supabase functions deploy api --no-verify-jwt
 ```
 
+Set `ALLOWED_ORIGINS` to the browser origin without a trailing slash, for example `https://publicpulse.pages.dev`, not `https://publicpulse.pages.dev/`. This is a **Supabase Edge Function secret**, not a Cloudflare build variable or Supabase Auth redirect URL. The function normalizes configured URL values to their origins and trims whitespace; redeploy the function to install that source fix. Unapproved origins are never reflected in CORS response headers.
+
+For the deployed PublicPulse project, the correction is:
+
+```powershell
+npx.cmd supabase secrets set ALLOWED_ORIGINS=https://publicpulse.pages.dev --project-ref kphuysgfmfvwhvgzfubn
+npx.cmd supabase functions deploy api --project-ref kphuysgfmfvwhvgzfubn --no-verify-jwt
+```
+
+Then reload the login page. In browser Network tools, the `OPTIONS` response should contain `Access-Control-Allow-Origin: https://publicpulse.pages.dev` exactly. No Cloudflare frontend rebuild is required for this backend-only correction.
+
 `verify_jwt=false` is intentional: `login` and the generic reset request are public operations. Every other operation calls `auth.getUser(bearer)` and reads the actual profile role/activation on the server. Administrator operations explicitly require an active administrator with a completed password change. Do not remove these checks. CORS is not an authorization boundary.
 
 The function uses Supabase's server-managed `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY`; never expose the latter to Vite. Multiple exact allowed origins may be comma-separated. Include preview origins only when you intend to permit those deployments. The import graph includes `src/lib/engine.ts` and `src/types.ts`; deploy from this repository root and preserve those paths.
@@ -40,6 +51,8 @@ The function's Deno import map pins its backend libraries. Check it with:
 ```sh
 npx deno check --config supabase/functions/api/deno.json supabase/functions/api/index.ts
 ```
+
+Public anonymous surveys and the source-dated geography importer have staging, production, and rollback steps in [PUBLIC_SURVEY_DEPLOYMENT.md](PUBLIC_SURVEY_DEPLOYMENT.md). Apply `202610190002_public_links.sql` before deploying the matching Edge Function/frontend. Keep the additive migration and public response history in place during an application rollback.
 
 Disable public Auth sign-ups in Supabase. Use minimum password length 12 for real accounts, and review Supabase Auth's platform rate limits. The API additionally enforces ten login attempts per account and IP per 15-minute window. For real deployments behind a proxy, confirm that the proxy overwrites trusted client-IP headers and add edge abuse protection if necessary. Internal Auth email aliases are not actual mailboxes; password recovery is administrator-mediated.
 

@@ -1,5 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
+import { corsHeaders, parseAllowedOrigins } from "../_shared/cors.ts";
 import { geographicReference } from "../../../src/lib/geography.ts";
 import {
   validateGraph,
@@ -20,22 +21,16 @@ const url = Deno.env.get("SUPABASE_URL")!,
 const db = createClient(url, serviceKey, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
-const allowed = (
+const allowed = parseAllowedOrigins(
   Deno.env.get("ALLOWED_ORIGINS") ||
-  "http://localhost:5173,http://127.0.0.1:5173"
-).split(",");
+    "http://localhost:5173,http://127.0.0.1:5173",
+);
 function result(body: unknown, status: number, origin: string) {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": allowed.includes(origin)
-        ? origin
-        : allowed[0],
-      "Access-Control-Allow-Headers":
-        "authorization, x-client-info, apikey, content-type",
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      Vary: "Origin",
+      ...corsHeaders(origin, allowed),
     },
   });
 }
@@ -56,6 +51,67 @@ async function rate(key: string) {
     .join("");
   const r = check(await db.rpc("reserve_login", { attempt_key: hash }));
   if (!r.data) throw Error("Too many attempts. Try again in 15 minutes.");
+}
+async function sha256(value: string) {
+  const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(bytes)).map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+async function publicRate(key: string, maxAttempts: number) {
+  const r = check(await db.rpc("reserve_public_attempt", { attempt_key: await sha256(key), max_attempts: maxAttempts }));
+  if (!r.data) throw Error("Too many attempts. Please wait before trying again.");
+}
+async function publicSurvey(token: string) {
+  const tokenHash = await sha256(token);
+  const link = check(await db.from("public_survey_links").select("id,survey_id,version,active,anonymous_allowed,expires_at")
+    .eq("token_hash", tokenHash).maybeSingle()).data;
+  if (!link || !link.active || !link.anonymous_allowed || (link.expires_at && Date.parse(link.expires_at) <= Date.now()))
+    throw Error("This survey link is invalid, inactive, expired, or does not allow anonymous responses.");
+  const [s, v, geo] = await Promise.all([
+    db.from("surveys").select("title,description,status,start_at,end_at").eq("id", link.survey_id).single(),
+    db.from("survey_versions").select("definition").eq("survey_id", link.survey_id).eq("version", link.version).single(),
+    db.from("geographies").select("id,name,level,parent_id,code").in("level", ["state", "district", "constituency", "locality", "ward"]).order("name"),
+  ]);
+  check(s); check(v); check(geo);
+  if (!s.data || !v.data) throw Error("This survey version is unavailable.");
+  if (s.data.status !== "published" || (s.data.start_at && Date.parse(s.data.start_at) > Date.now()) || (s.data.end_at && Date.parse(s.data.end_at) < Date.now())) throw Error("This survey is not currently open.");
+  return { tokenHash, survey: { id: link.survey_id, title: s.data.title, description: s.data.description, ...(v.data.definition as object) } as SurveyVersion & Survey, geographies: geo.data || [] };
+}
+function validateConfiguredGeographies(answers: Record<string, unknown>, questions: SurveyVersion["questions"], references: Geography[]) {
+  const byId = new Map(references.map((g) => [g.id, g]));
+  const state = references.find((g) => g.level === "state" && g.name === answers.state);
+  const district = references.find((g) => g.level === "district" && g.name === answers.district && g.parent_id === state?.id);
+  const root = district || state;
+  for (const q of questions.filter((item) => item.type === "geography" && !["state", "district"].includes(item.id))) {
+    const value = String(answers[q.id] || "");
+    if (!value) continue;
+    const candidate = references.find((g) => g.level === q.id && g.name === value);
+    if (!candidate || !root) throw Error(`${q.label}: select a valid geography from the configured list.`);
+    let parent = candidate.parent_id; const seen = new Set<string>(); let inside = false;
+    while (parent && !seen.has(parent)) { if (parent === root.id) { inside = true; break; } seen.add(parent); parent = byId.get(parent)?.parent_id || null; }
+    if (!inside) throw Error(`${q.label}: this area is outside the selected district.`);
+  }
+}
+async function submitPublic(payload: Record<string, unknown>, req: Request) {
+  const token = z.string().min(32).max(128).parse(payload.token);
+  const { tokenHash, survey, geographies } = await publicSurvey(token);
+  const source = payload.source === "qr" ? "qr" : "public_link";
+  const ip = req.headers.get("cf-connecting-ip") || req.headers.get("x-real-ip") || req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+  await publicRate("link:" + tokenHash, 500);
+  if (ip !== "unknown") await publicRate("link-ip:" + tokenHash + ":" + ip, 20);
+  const doc = z.object({ id: z.string().uuid(), version: z.number().int().positive(), created_at: z.string().datetime(), answers: z.record(z.unknown()), consent: z.literal(true) }).parse(payload.response);
+  if (doc.version !== survey.version || doc.answers.consent !== "I agree to participate") throw Error("Explicit consent is required.");
+  const visible = visibleQuestions(survey.questions, survey.rules, doc.answers);
+  for (const q of visible) { const error = validateAnswer(q, doc.answers[q.id], doc.answers); if (error) throw Error(`${q.label}: ${error}`); }
+  const valid = new Set(visible.filter(q => !["section", "instruction"].includes(q.type)).map(q => q.id));
+  if (Object.keys(doc.answers).some(id => !valid.has(id))) throw Error("Unexpected or hidden answer field.");
+  const state = String(doc.answers.state || ""), district = String(doc.answers.district || "");
+  const stateRef = check(await db.from("geographies").select("id").eq("name", state).eq("level", "state").maybeSingle()).data;
+  if (survey.questions.some(q => q.id === "state" && q.required) && !stateRef) throw Error("Invalid state reference.");
+  if (district && (!stateRef || !check(await db.from("geographies").select("id").eq("name", district).eq("parent_id", stateRef.id).maybeSingle()).data)) throw Error("District does not belong to the selected state.");
+  validateConfiguredGeographies(doc.answers, survey.questions, geographies);
+  const record = { id: doc.id, survey_id: survey.id, version: doc.version, created_at: doc.created_at, answers: doc.answers, consent: true, state, district, geography: state, status: "completed" };
+  check(await db.rpc("submit_public_response", { link_hash: tokenHash, doc: record, response_source: source }));
+  return { ok: true };
 }
 async function principal(req: Request) {
   const bearer = req.headers.get("Authorization")?.replace(/^Bearer /i, "");
@@ -445,6 +501,7 @@ async function submit(doc: ResponseRecord, p: Profile) {
     }
     const references =
       check(await db.from("geographies").select("*")).data || [];
+    validateConfiguredGeographies(doc.answers, version.questions, references);
     doc.geography = geographicReference(doc.answers, references);
   }
   check(await db.rpc("submit_response", { doc }));
@@ -461,6 +518,12 @@ Deno.serve(async (req) => {
     if (Number(req.headers.get("content-length") || 0) > 5_000_000)
       throw Error("Request too large.");
     const { action, payload = {} } = await req.json();
+    if (action === "public-survey") {
+      const doc = await publicSurvey(z.string().min(32).max(128).parse(payload.token));
+      return result({ survey: doc.survey, geographies: doc.geographies }, 200, origin);
+    }
+    if (action === "submit-public-response")
+      return result(await submitPublic(payload, req), 200, origin);
     if (action === "login" || action === "recover") {
       const username = z
         .string()
@@ -542,6 +605,30 @@ Deno.serve(async (req) => {
     if (action === "submit-response")
       return result(await submit(payload, p), 200, origin);
     requireAdmin(p);
+    if (action === "create-public-link") {
+      const input = z.object({ survey_id: z.string().uuid(), version: z.number().int().positive(), token: z.string().min(32).max(128), expires_at: z.string().datetime().nullable().optional(), anonymous_allowed: z.boolean().default(true) }).parse(payload);
+      const survey = check(await db.from("surveys").select("status").eq("id", input.survey_id).single()).data;
+      if (!survey) throw Error("Survey not found.");
+      if (survey.status !== "published") throw Error("Publish the survey before creating a public link.");
+      const token_hash = await sha256(input.token);
+      check(await db.from("public_survey_links").insert({ token_hash, survey_id: input.survey_id, version: input.version, expires_at: input.expires_at || null, anonymous_allowed: input.anonymous_allowed, created_by: p.id }));
+      await audit(p.id, `Created public link for survey ${input.survey_id} v${input.version}`);
+      return result({ ok: true }, 200, origin);
+    }
+    if (action === "list-public-links") {
+      const rows = check(await db.from("public_survey_links").select("id,survey_id,version,active,anonymous_allowed,expires_at,created_at").order("created_at", { ascending: false })).data || [];
+      const links = await Promise.all(rows.map(async (link) => {
+        const countResult = check(await db.from("responses").select("id", { count: "exact", head: true }).eq("public_link_id", link.id));
+        return { ...link, expired: !!link.expires_at && Date.parse(link.expires_at) <= Date.now(), responses: countResult.count || 0 };
+      }));
+      return result(links, 200, origin);
+    }
+    if (action === "set-public-link") {
+      const input = z.object({ id: z.string().uuid(), active: z.boolean() }).parse(payload);
+      check(await db.from("public_survey_links").update({ active: input.active }).eq("id", input.id));
+      await audit(p.id, `${input.active ? "Activated" : "Deactivated"} public link ${input.id}`);
+      return result({ ok: true }, 200, origin);
+    }
     if (action === "save-workspace") {
       await saveWorkspace(payload, p);
       return result({ ok: true }, 200, origin);

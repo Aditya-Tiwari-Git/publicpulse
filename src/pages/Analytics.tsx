@@ -48,6 +48,7 @@ export type Filters = {
   income: string;
   occupation: string;
   priority: string;
+  source: string;
 };
 export const blankFilters: Filters = {
   survey: "",
@@ -61,6 +62,7 @@ export const blankFilters: Filters = {
   income: "",
   occupation: "",
   priority: "",
+  source: "",
 };
 export function filterResponses(rows: ResponseRecord[], f: Filters) {
   return rows.filter(
@@ -71,6 +73,7 @@ export function filterResponses(rows: ResponseRecord[], f: Filters) {
       (!f.to || r.created_at.slice(0, 10) <= f.to) &&
       (!f.state || r.state === f.state) &&
       (!f.district || r.district === f.district) &&
+      (!f.source || (r.source || "surveyor") === f.source) &&
       [
         "constituency",
         "rural_urban",
@@ -148,6 +151,7 @@ export function FilterBar({
             onChange={(e) => onChange({ ...f, from: e.target.value })}
           />
         </label>
+        <label>Response source<select value={f.source} onChange={(e) => onChange({ ...f, source: e.target.value })}><option value="">All sources</option><option value="surveyor">Field surveyor</option><option value="public_link">Public link</option><option value="qr">QR link</option></select></label>
         <label>
           To
           <input
@@ -560,6 +564,10 @@ export default function Analytics() {
           </small>
         </div>
       </div>
+      <Card title="Collection source" subtitle="Counts use stored response source. Small groups are suppressed; QR and public links use the same anonymous respondent flow.">
+        <div className="source-summary">{(["surveyor", "public_link", "qr"] as const).map((source) => { const count = rows.filter((r) => (r.source || "surveyor") === source).length; return <div key={source}><span>{source === "surveyor" ? "Field surveyor" : source === "public_link" ? "Public link" : "QR link"}</span><strong>{count >= min ? count : count ? "Suppressed" : "0"}</strong></div>; })}</div>
+      </Card>
+      {metric === "current_rep" && <p className="muted">Representative answers are shown as entered. Spelling variants are kept separate; no identity matching is inferred.</p>}
       <div className="section-toolbar">
         <h2 className="section-heading">Question-level insights</h2>
         <select

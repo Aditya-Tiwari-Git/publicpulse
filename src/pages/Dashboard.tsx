@@ -491,15 +491,15 @@ export default function Dashboard() {
                       .find((p) => p.id === r.surveyor_id)
                       ?.name.split(" ")
                       .map((s) => s[0])
-                      .join("") || "FS"}
+                      .join("") || (r.source === "qr" ? "QR" : "PL")}
                   </span>
                   <div>
                     <strong>
                       {data.profiles.find((p) => p.id === r.surveyor_id)
-                        ?.name || "Field surveyor"}
+                        ?.name || (r.source === "qr" ? "QR respondent" : r.source === "public_link" ? "Public respondent" : "Field surveyor")}
                     </strong>
                     <p>
-                      Collected a response in <b>{r.district}</b>
+                      Submitted a response in <b>{r.district || r.state || "an unreported area"}</b>
                     </p>
                     <small>
                       {new Date(r.created_at).toLocaleString("en-IN", {

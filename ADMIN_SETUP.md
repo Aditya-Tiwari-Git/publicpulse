@@ -2,7 +2,7 @@
 
 ## Bootstrap the first real administrator
 
-1. Create a Supabase project or start the Supabase CLI locally using Docker. Apply `supabase/migrations/202610170001_initial.sql` before running the script.
+1. Create a Supabase project or start the Supabase CLI locally using Docker. Apply all committed migrations in order before running the script (`supabase db push` for a linked project, or `supabase db reset` locally).
 2. In a trusted terminal, set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`. These are **server-side** variables, not Vite variables. Do not commit them or paste them into frontend settings.
 3. For a production project, set a unique `BOOTSTRAP_USERNAME`, `BOOTSTRAP_NAME` and `BOOTSTRAP_PASSWORD` (at least 12 characters). The script rejects the known development password remotely.
 4. Run `npm run seed:admin` with Node 24. The script refuses to run when an admin already exists. It creates one Supabase Auth user, a profile and private username mapping; publishes the editable India template; and initializes a small issue dictionary. It prints the username, never the password or key. No real recovery email is needed; the internal alias is a random UUID at `auth.publicpulse.invalid`.
